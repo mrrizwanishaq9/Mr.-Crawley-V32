@@ -1,0 +1,627 @@
+#!/usr/bin/env python3
+
+"""
+Mr. Crawley V32
+Web Crawler & OSINT Learning Tool
+
+For educational use and authorized/public web crawling only.
+"""
+
+import argparse
+import csv
+import json
+import os
+import queue
+import re
+import sys
+import threading
+import time
+from collections import deque
+from urllib.parse import urljoin, urlparse, urldefrag
+import requests
+from bs4 import BeautifulSoup
+
+
+VERSION = "V32"
+DEFAULT_UA = (
+    "MrCrawley/32.0 "
+    "(Educational Web Crawler; +https://example.com)"
+)
+
+print_lock = threading.Lock()
+
+
+def banner():
+    print(r"""
+╔══════════════════════════════════════════════════════════════╗
+║                    MR. CRAWLEY V32                          ║
+║             WEB CRAWLER & OSINT LEARNING TOOL               ║
+╠══════════════════════════════════════════════════════════════╣
+║  Public Web Crawler • URL Discovery • Export • Statistics   ║
+╚══════════════════════════════════════════════════════════════╝
+""")
+
+
+def safe_print(text):
+    with print_lock:
+        print(text, flush=True)
+
+
+def normalize_url(url):
+    url = url.strip()
+
+    if not url:
+        return None
+
+    if not re.match(r"^https?://", url, re.I):
+        url = "https://" + url
+
+    url, _ = urldefrag(url)
+
+    parsed = urlparse(url)
+
+    if parsed.scheme not in ("http", "https"):
+        return None
+
+    if not parsed.netloc:
+        return None
+
+    return url
+
+
+def same_domain(url, base_domain):
+    return urlparse(url).netloc.lower() == base_domain.lower()
+
+
+def get_title(html):
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+
+        if soup.title:
+            return soup.title.get_text(" ", strip=True)[:300]
+
+    except Exception:
+        pass
+
+    return "No title"
+
+
+def extract_links(html, current_url):
+    links = set()
+
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+
+        for tag in soup.find_all("a", href=True):
+            href = tag.get("href", "").strip()
+
+            if not href:
+                continue
+
+            if href.startswith(("#", "javascript:", "mailto:", "tel:")):
+                continue
+
+            absolute = urljoin(current_url, href)
+            absolute, _ = urldefrag(absolute)
+
+            parsed = urlparse(absolute)
+
+            if parsed.scheme in ("http", "https"):
+                links.add(absolute)
+
+    except Exception:
+        pass
+
+    return links
+
+
+class MrCrawley:
+
+    def __init__(
+        self,
+        target,
+        max_pages=50,
+        workers=5,
+        delay=1.0,
+        timeout=10,
+        output="mr_crawley_results",
+        custom_headers=None,
+    ):
+        self.target = normalize_url(target)
+
+        if not self.target:
+            raise ValueError("Invalid target URL.")
+
+        self.max_pages = max(1, max_pages)
+        self.workers = max(1, min(workers, 20))
+        self.delay = max(0, delay)
+        self.timeout = max(1, timeout)
+
+        self.output = output
+
+        self.session = requests.Session()
+
+        headers = {
+            "User-Agent": DEFAULT_UA,
+            "Accept": "text/html,application/xhtml+xml",
+        }
+
+        if custom_headers:
+            headers.update(custom_headers)
+
+        self.session.headers.update(headers)
+
+        parsed = urlparse(self.target)
+
+        self.domain = parsed.netloc
+
+        self.to_visit = deque([self.target])
+
+        self.visited = set()
+        self.discovered = {self.target}
+
+        self.results = []
+
+        self.internal_links = 0
+        self.external_links = 0
+        self.failed = 0
+        self.duplicates = 0
+
+        self.lock = threading.Lock()
+
+        self.stop_event = threading.Event()
+
+        self.start_time = None
+
+    def check_robots(self):
+        robots_url = urljoin(self.target, "/robots.txt")
+
+        safe_print("[+] Checking robots.txt...")
+
+        try:
+            response = self.session.get(
+                robots_url,
+                timeout=self.timeout
+            )
+
+            if response.status_code == 200:
+                safe_print("[✓] robots.txt found")
+                return response.text
+
+            safe_print("[i] robots.txt not available")
+
+        except requests.RequestException:
+            safe_print("[i] robots.txt check failed")
+
+        return ""
+
+    def get_next_url(self):
+        with self.lock:
+
+            while self.to_visit:
+
+                url = self.to_visit.popleft()
+
+                if url in self.visited:
+                    self.duplicates += 1
+                    continue
+
+                if len(self.visited) >= self.max_pages:
+                    return None
+
+                self.visited.add(url)
+
+                return url
+
+        return None
+
+    def add_url(self, url):
+        if url in self.discovered:
+            return False
+
+        self.discovered.add(url)
+
+        with self.lock:
+            self.to_visit.append(url)
+
+        return True
+
+    def crawl_page(self, url):
+
+        if self.stop_event.is_set():
+            return
+
+        if self.delay:
+            time.sleep(self.delay)
+
+        try:
+            response = self.session.get(
+                url,
+                timeout=self.timeout,
+                allow_redirects=True
+            )
+
+            final_url = response.url
+
+            content_type = response.headers.get(
+                "Content-Type",
+                ""
+            ).lower()
+
+            status = response.status_code
+
+            if "text/html" not in content_type:
+
+                safe_print(
+                    f"[{status}] {url}\n"
+                    f"     Content: {content_type}"
+                )
+
+                with self.lock:
+                    self.results.append({
+                        "url": url,
+                        "final_url": final_url,
+                        "status": status,
+                        "content_type": content_type,
+                        "title": "",
+                        "internal_links": 0,
+                        "external_links": 0,
+                    })
+
+                return
+
+            html = response.text
+
+            title = get_title(html)
+
+            links = extract_links(html, final_url)
+
+            internal = 0
+            external = 0
+
+            for link in links:
+
+                if same_domain(link, self.domain):
+
+                    internal += 1
+
+                    if len(self.discovered) < self.max_pages:
+                        self.add_url(link)
+
+                else:
+                    external += 1
+
+            with self.lock:
+                self.internal_links += internal
+                self.external_links += external
+
+                self.results.append({
+                    "url": url,
+                    "final_url": final_url,
+                    "status": status,
+                    "content_type": content_type,
+                    "title": title,
+                    "internal_links": internal,
+                    "external_links": external,
+                })
+
+            safe_print(
+                f"\n[{len(self.results):02d}] "
+                f"[{status}] {final_url}\n"
+                f"     Title: {title}\n"
+                f"     Internal: {internal} | External: {external}"
+            )
+
+        except requests.RequestException as error:
+
+            with self.lock:
+                self.failed += 1
+
+            safe_print(
+                f"[ERROR] {url}\n"
+                f"        {error}"
+            )
+
+    def worker(self):
+
+        while not self.stop_event.is_set():
+
+            with self.lock:
+                if len(self.visited) >= self.max_pages:
+                    break
+
+            url = self.get_next_url()
+
+            if not url:
+                break
+
+            self.crawl_page(url)
+
+    def run(self):
+
+        self.start_time = time.time()
+
+        self.check_robots()
+
+        safe_print("")
+        safe_print(f"[+] Target : {self.target}")
+        safe_print(f"[+] Domain : {self.domain}")
+        safe_print(f"[+] Threads: {self.workers}")
+        safe_print(f"[+] Delay  : {self.delay}s")
+        safe_print(f"[+] Max    : {self.max_pages}")
+        safe_print("")
+        safe_print("────────────────────────────────────────────")
+
+        threads = []
+
+        for _ in range(self.workers):
+
+            thread = threading.Thread(
+                target=self.worker,
+                daemon=True
+            )
+
+            thread.start()
+            threads.append(thread)
+
+        try:
+
+            for thread in threads:
+                thread.join()
+
+        except KeyboardInterrupt:
+
+            safe_print("\n[!] Ctrl+C detected.")
+            self.stop_event.set()
+
+            for thread in threads:
+                thread.join(timeout=1)
+
+        elapsed = time.time() - self.start_time
+
+        self.show_summary(elapsed)
+
+        self.save_results()
+
+    def show_summary(self, elapsed):
+
+        print("\n")
+        print("══════════════════════════════════════════════")
+        print("              CRAWL SUMMARY")
+        print("══════════════════════════════════════════════")
+
+        print(f"Pages visited       : {len(self.visited)}")
+        print(f"URLs discovered     : {len(self.discovered)}")
+        print(f"Internal links      : {self.internal_links}")
+        print(f"External links      : {self.external_links}")
+        print(f"Successful results  : {len(self.results)}")
+        print(f"Failed requests     : {self.failed}")
+        print(f"Duplicates skipped  : {self.duplicates}")
+        print(f"Elapsed time        : {elapsed:.2f} sec")
+
+        print("══════════════════════════════════════════════")
+
+    def save_results(self):
+
+        os.makedirs(
+            os.path.dirname(self.output) or ".",
+            exist_ok=True
+        )
+
+        base = self.output
+
+        if base.endswith((".json", ".csv", ".txt")):
+            base = os.path.splitext(base)[0]
+
+        json_file = base + ".json"
+        csv_file = base + ".csv"
+        txt_file = base + ".txt"
+
+        # JSON
+        try:
+
+            with open(
+                json_file,
+                "w",
+                encoding="utf-8"
+            ) as file:
+
+                json.dump(
+                    self.results,
+                    file,
+                    indent=4,
+                    ensure_ascii=False
+                )
+
+        except OSError as error:
+            print(f"[!] JSON save error: {error}")
+
+        # CSV
+        try:
+
+            with open(
+                csv_file,
+                "w",
+                newline="",
+                encoding="utf-8"
+            ) as file:
+
+                fields = [
+                    "url",
+                    "final_url",
+                    "status",
+                    "content_type",
+                    "title",
+                    "internal_links",
+                    "external_links",
+                ]
+
+                writer = csv.DictWriter(
+                    file,
+                    fieldnames=fields
+                )
+
+                writer.writeheader()
+
+                writer.writerows(self.results)
+
+        except OSError as error:
+            print(f"[!] CSV save error: {error}")
+
+        # TXT
+        try:
+
+            with open(
+                txt_file,
+                "w",
+                encoding="utf-8"
+            ) as file:
+
+                file.write(
+                    f"MR. CRAWLEY {VERSION}\n"
+                    f"Target: {self.target}\n"
+                    f"Domain: {self.domain}\n"
+                    f"{'=' * 60}\n\n"
+                )
+
+                for index, item in enumerate(
+                    self.results,
+                    start=1
+                ):
+
+                    file.write(
+                        f"[{index}] {item['status']} "
+                        f"{item['url']}\n"
+                    )
+
+                    file.write(
+                        f"Title: {item['title']}\n"
+                    )
+
+                    file.write(
+                        f"Content-Type: "
+                        f"{item['content_type']}\n"
+                    )
+
+                    file.write(
+                        f"Internal Links: "
+                        f"{item['internal_links']}\n"
+                    )
+
+                    file.write(
+                        f"External Links: "
+                        f"{item['external_links']}\n\n"
+                    )
+
+        except OSError as error:
+            print(f"[!] TXT save error: {error}")
+
+        print("\n[✓] Results saved:")
+        print(f"    ├── {json_file}")
+        print(f"    ├── {csv_file}")
+        print(f"    └── {txt_file}")
+
+
+def parse_headers(header_list):
+
+    headers = {}
+
+    for item in header_list or []:
+
+        if ":" not in item:
+            continue
+
+        key, value = item.split(":", 1)
+
+        key = key.strip()
+        value = value.strip()
+
+        if key:
+            headers[key] = value
+
+    return headers
+
+
+def main():
+
+    banner()
+
+    parser = argparse.ArgumentParser(
+        description="Mr. Crawley V32 - Educational Web Crawler"
+    )
+
+    parser.add_argument(
+        "url",
+        help="Target public/authorized URL"
+    )
+
+    parser.add_argument(
+        "--max-pages",
+        type=int,
+        default=50,
+        help="Maximum pages to crawl"
+    )
+
+    parser.add_argument(
+        "--threads",
+        type=int,
+        default=5,
+        help="Number of worker threads"
+    )
+
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=1.0,
+        help="Delay between requests"
+    )
+
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=10,
+        help="Request timeout"
+    )
+
+    parser.add_argument(
+        "--output",
+        default="mr_crawley_results",
+        help="Output file prefix"
+    )
+
+    parser.add_argument(
+        "--header",
+        action="append",
+        help='Custom header, e.g. --header "X-Test: 123"'
+    )
+
+    args = parser.parse_args()
+
+    headers = parse_headers(args.header)
+
+    try:
+
+        crawler = MrCrawley(
+            target=args.url,
+            max_pages=args.max_pages,
+            workers=args.threads,
+            delay=args.delay,
+            timeout=args.timeout,
+            output=args.output,
+            custom_headers=headers,
+        )
+
+        crawler.run()
+
+    except KeyboardInterrupt:
+
+        print("\n[!] Stopped by user.")
+
+    except Exception as error:
+
+        print(f"\n[!] Error: {error}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
